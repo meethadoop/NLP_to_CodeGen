@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to deploy RHEL EC2 instance with root and custom user SSH access'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair
+  
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: must be a valid EC2 instance type
+    
+  UserPassword:
+    Description: Password for the custom user
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    ConstraintDescription: Must be between 8 and 41 characters
+    
+  RootPassword:
+    Description: Password for root user
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    ConstraintDescription: Must be between 8 and 41 characters
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref 'InstanceType'
+      SecurityGroups:
+        - !Ref 'InstanceSecurityGroup'
+      KeyName: !Ref 'KeyName'
+      ImageId: ami-0aa8fc2422063977a  # RHEL AMI ID
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Set root password
+          echo "root:${RootPassword}" | chpasswd
+          
+          # Create new user with sudo privileges
+          useradd -m adminuser
+          echo "adminuser:${UserPassword}" | chpasswd
+          usermod -aG wheel adminuser
+          
+          # Configure SSH for remote access and password authentication
+          cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+          
+          # Update SSH configuration
+          cat > /etc/ssh/sshd_config << 'EOF'
+          Port 22
+          Protocol 2
+          HostKey /etc/ssh/ssh_host_rsa_key
+          HostKey /etc/ssh/ssh_host_ecdsa_key
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          SyslogFacility AUTHPRIV
+          
+          # Authentication settings
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          PermitEmptyPasswords no
+          ChallengeResponseAuthentication no
+          GSSAPIAuthentication yes
+          GSSAPICleanupCredentials no
+          UsePAM yes
+          X11Forwarding yes
+          
+          # Allow TCP forwarding
+          AllowTcpForwarding yes
+          
+          # Enable password login
+          UseDNS no
+          AddressFamily inet
+          
+          # Accept locale-related environment variables
+          AcceptEnv LANG LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES
+          AcceptEnv LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT
+          AcceptEnv LC_IDENTIFICATION LC_ALL LANGUAGE
+          AcceptEnv XMODIFIERS
+          
+          # Subsystem for SFTP
+          Subsystem sftp /usr/libexec/openssh/sftp-server
+          
+          # Custom settings
+          ClientAliveInterval 120
+          ClientAliveCountMax 720
+          EOF
+          
+          # Set correct permissions on SSH config
+          chmod 600 /etc/ssh/sshd_config
+          
+          # Allow sudo without password for adminuser
+          echo "adminuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/adminuser
+          chmod 440 /etc/sudoers.d/adminuser
+          
+          # Configure SELinux context for the new user's home directory
+          semanage fcontext -a -t user_home_dir_t "/home/adminuser(/.*)?"
+          restorecon -R -v /home/adminuser
+          
+          # Configure firewall to allow SSH
+          firewall-cmd --permanent --add-service=ssh
+          firewall-cmd --reload
+          
+          # Restart SSH service
+          systemctl restart sshd
+          
+          # Set proper permissions for adminuser home directory
+          chmod 700 /home/adminuser
+          chown adminuser:adminuser /home/adminuser -R
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  InstanceId:
+    Description: Instance ID of the newly created EC2 instance
+    Value: !Ref 'EC2Instance'
+  
+  PublicDNS:
+    Description: Public DNSName of the newly created EC2 instance
+    Value: !GetAtt 'EC2Instance.PublicDnsName'
+  
+  PublicIP:
+    Description: Public IP address of the newly created EC2 instance
+    Value: !GetAtt 'EC2Instance.PublicIp'
+  
+  SSHCommandAdmin:
+    Description: Command to connect as adminuser
+    Value: !Sub 'ssh adminuser@${EC2Instance.PublicIp}'
+    
+  SSHCommandRoot:
+    Description: Command to connect as root
+    Value: !Sub 'ssh root@${EC2Instance.PublicIp}'
+
+
+    #
+  #  /* To deploy in AWS cli : 
+  #  aws cloudformation create-stack \
+  #--stack-name my-spot-instance \
+  #--template-body file://spot-instance.yaml \
+  #--parameters \
+  #  ParameterKey=KeyName,ParameterValue=your-key-pair-name \
+  #  ParameterKey=RootUsername,ParameterValue=adminuser \
+  #  ParameterKey=RootPassword,ParameterValue=your-secure-password */
+  #
+  #   /* id :    ami-0aa8fc2422063977a 
+  #  username : ec2-user 
+  #  given user : ameya 
+  #  psswd : admin123 
+  # aws ec2 describe-spot-fleet-instances --spot-fleet-request-id <SpotFleetId>
+  #  ! Delete all the created resureces remove the stack  */
